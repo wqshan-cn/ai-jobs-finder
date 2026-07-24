@@ -1,0 +1,16 @@
+{
+  "name": "ai-jobs-finder",
+  "version": "1.0.0",
+  "description": "AI厂商招聘信息实时聚合查询平台",
+  "scripts": {
+    "server": "node server/index.js",
+    "client": "cd client && npm run dev",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "install-all": "cd server && npm install && cd ../client && npm install"
+  },
+  "keywords": ["ai", "jobs", "recruitment"],
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
