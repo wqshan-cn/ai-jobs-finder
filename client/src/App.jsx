@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 
 const API_BASE = '/api'
 
@@ -194,6 +194,7 @@ function App() {
   const [sourceCount, setSourceCount] = useState({ china: 0, overseas: 0 })
   const [selectedJob, setSelectedJob] = useState(null) // 详情页状态
   const [detailLoading, setDetailLoading] = useState(false) // 详情加载中
+  const detailRequestId = useRef(0)
 
   useEffect(() => {
     fetch(`${API_BASE}/companies`).then(r => r.json()).then(d => setCompanies(d.companies || [])).catch(() => {})
@@ -207,6 +208,7 @@ function App() {
       if (selectedCompany) params.set('company', selectedCompany)
       params.set('source', selectedSource)
       const res = await fetch(`${API_BASE}/jobs/all?${params}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
       setJobs(data.jobs || [])
       setTotalCount(data.total || 0)
@@ -224,6 +226,7 @@ function App() {
       params.set('source', selectedSource)
       const qs = params.toString()
       const res = await fetch(`${API_BASE}/stats${qs ? '?' + qs : ''}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setStats(await res.json())
     } catch { setError('获取统计数据失败') }
     finally { setStatsLoading(false) }
@@ -233,19 +236,31 @@ function App() {
 
   // 点击卡片：先展示基本信息，再按需从官网抓取完整详情
   const openJobDetail = useCallback(async (job) => {
+    const requestId = ++detailRequestId.current
     setSelectedJob(job)
     // 如果已有完整详情则不再请求
     if ((job.responsibility || job.requirement) && (job.description || '').length > 200) return
     setDetailLoading(true)
     try {
       const res = await fetch(`${API_BASE}/jobs/${encodeURIComponent(job.id)}/detail`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      if (data.job) setSelectedJob(data.job)
+      if (requestId === detailRequestId.current && data.job) setSelectedJob(data.job)
     } catch { /* 保持基本信息 */ }
     finally { setDetailLoading(false) }
   }, [])
 
   const handleSearch = (e) => { e.preventDefault(); if (activeTab === 'stats') fetchStats(); else fetchJobs() }
+  const handleSourceChange = (e) => {
+    const source = e.target.value
+    setSelectedSource(source)
+    if (!selectedCompany || source === 'all') return
+    const company = companies.find(item => item.name === selectedCompany)
+    const isChinaCompany = company?.source === '官网'
+    if ((source === 'china' && !isChinaCompany) || (source === 'overseas' && isChinaCompany)) {
+      setSelectedCompany('')
+    }
+  }
   const switchTab = (tab) => { setActiveTab(tab); if (tab === 'stats') fetchStats() }
 
   const formatDate = (d) => { if (!d) return ''; try { return new Date(d).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) } catch { return '' } }
@@ -273,7 +288,7 @@ function App() {
               {companies.filter(c => c.source !== '官网').map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
             </optgroup>
           </select>
-          <select value={selectedSource} onChange={e => setSelectedSource(e.target.value)} className="select-input">
+          <select value={selectedSource} onChange={handleSourceChange} className="select-input">
             <option value="china">国内厂商</option>
             <option value="overseas">海外厂商</option>
             <option value="all">全部</option>

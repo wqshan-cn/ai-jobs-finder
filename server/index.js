@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const puppeteer = require('puppeteer-core');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = 3001;
@@ -63,6 +64,7 @@ const COMPANIES = {
 // ============ 缓存管理 ============
 const CACHE_TTL = 10 * 60 * 1000;
 const cache = new Map();
+const DETAIL_CACHE_TTL = 10 * 60 * 1000;
 
 function getCache(key) {
   const entry = cache.get(key);
@@ -84,6 +86,11 @@ async function withCache(key, fetchFn) {
   const data = await fetchFn();
   if (data && data.length > 0) setCache(key, data);
   return data;
+}
+
+function stableJobId(prefix, ...parts) {
+  const value = parts.filter(Boolean).join('|');
+  return `${prefix}_${crypto.createHash('sha1').update(value).digest('hex').slice(0, 16)}`;
 }
 
 // ============ Puppeteer 浏览器管理 ============
@@ -345,7 +352,7 @@ async function fetchQwenJobs() {
     
     console.log(`[阿里千问] 总计: ${allJobs.length} 个职位`);
     return allJobs.slice(0, 200).map((job, idx) => ({
-      id: `qwen_${idx}`,
+      id: stableJobId('qwen', job.title, job.location, job.category),
       title: job.title, company: '阿里千问', companyType: '大模型',
       logo: 'https://img.alicdn.com/imgextra/i1/O1CN01AKUdEM1oPxOVjmFEg_!!6000000005218-2-tps-1024-1024.png',
       location: job.location || '未知', url: 'https://talent.quark.cn/off-campus/position-list?lang=zh',
@@ -393,7 +400,7 @@ async function fetchHuaweiJobs2() {
     });
     console.log(`[华为/猎聘] 获取: ${jobs.length} 个职位`);
     return jobs.slice(0, 40).map((job, idx) => ({
-      id: `huawei_${idx}`,
+      id: stableJobId('huawei_liepin', job.title, job.location, job.salary, job.exp, job.edu),
       title: job.title,
       company: '华为',
       companyType: 'AI/芯片',
@@ -506,7 +513,7 @@ async function fetchHuaweiJobs(keyword = '') {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     return (data?.data?.list || []).map(job => ({
-      id: `huawei_${job.id}`, title: job.name, company: '华为', companyType: 'AI/芯片',
+      id: `huawei_api_${job.id}`, title: job.name, company: '华为', companyType: 'AI/芯片',
       logo: 'https://www.huawei.com/favicon.ico', location: job.workPlace || '未知',
       url: `https://career.huawei.com/reccampportal/portal5/detail.html?id=${job.id}`, source: '官网',
       updatedAt: job.publishTime || '', department: job.deptName || '',
@@ -587,10 +594,10 @@ app.get('/api/jobs/all', async (req, res) => {
     const kw = keyword || '';
     let fetchers = [];
     if (!company || company === 'Kimi(月之暗面)') fetchers.push(withCache('kimi', () => fetchGreenhouseJobs({ name: 'Kimi(月之暗面)', greenhouse: 'moonshot', type: '大模型', logo: 'https://kimi.moonshot.cn/favicon.ico' })));
-    if (!company || company === '腾讯') fetchers.push(withCache('tencent', () => fetchTencentJobs(kw)));
-    if (!company || company === '百度') fetchers.push(withCache('baidu', () => fetchBaiduJobs(kw)));
-    if (!company || company === '华为') fetchers.push(withCache('huawei', () => fetchHuaweiJobs(kw)));
-    if (!company || company === '字节跳动') fetchers.push(withCache('bytedance', () => fetchByteDanceJobs(kw)));
+    if (!company || company === '腾讯') fetchers.push(withCache(`tencent:${kw}`, () => fetchTencentJobs(kw)));
+    if (!company || company === '百度') fetchers.push(withCache(`baidu:${kw}`, () => fetchBaiduJobs(kw)));
+    if (!company || company === '华为') fetchers.push(withCache(`huawei:${kw}`, () => fetchHuaweiJobs(kw)));
+    if (!company || company === '字节跳动') fetchers.push(withCache(`bytedance:${kw}`, () => fetchByteDanceJobs(kw)));
     if (!company || company === 'MiniMax') fetchers.push(withCache('minimax', fetchMiniMaxJobs));
     if (!company || company === 'DeepSeek') fetchers.push(withCache('deepseek', fetchDeepSeekJobs));
     if (!company || company === '智谱AI(GLM)') fetchers.push(withCache('zhipu', fetchZhipuJobs));
@@ -616,10 +623,6 @@ app.get('/api/jobs/all', async (req, res) => {
         ...asCompanies.map(c => withCache(`ashby_${c.token}`, () => fetchAshbyJobs(c))),
       ]);
       overseasJobs = results.filter(r => r.status === 'fulfilled').flatMap(r => r.value);
-      if (keyword) {
-        const kw = keyword.toLowerCase();
-        overseasJobs = overseasJobs.filter(j => j.title.toLowerCase().includes(kw) || j.department.toLowerCase().includes(kw) || j.location.toLowerCase().includes(kw));
-      }
     })());
   }
 
@@ -634,6 +637,13 @@ app.get('/api/jobs/all', async (req, res) => {
   // 过滤游戏相关职位 + 清理部门标签
   allJobs = filterGameJobs(allJobs);
   cleanDepartments(allJobs);
+  if (keyword) {
+    const query = keyword.toLowerCase().trim();
+    allJobs = allJobs.filter(job => [
+      job.title, job.department, job.location, job.description,
+      job.requirement, job.responsibility,
+    ].filter(Boolean).join(' ').toLowerCase().includes(query));
+  }
 
   allJobs.forEach(job => { jobStore.set(job.id, job); });
   // 过滤后重新计算来源数量（确保与 total 一致）
@@ -646,6 +656,16 @@ app.get('/api/jobs/all', async (req, res) => {
 // 职位详情存储
 const jobStore = new Map();
 const detailCache = new Map();
+
+function getDetailCache(id) {
+  const entry = detailCache.get(id);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp >= DETAIL_CACHE_TTL) {
+    detailCache.delete(id);
+    return null;
+  }
+  return entry.job;
+}
 
 // ============ 按需抓取职位完整详情 ============
 async function fetchFeishuJobDetail(url) {
@@ -753,9 +773,10 @@ async function enrichJobDetail(job) {
 app.get('/api/jobs/:id/detail', async (req, res) => {
   const base = jobStore.get(req.params.id);
   if (!base) return res.status(404).json({ error: '职位未找到，请先刷新列表' });
-  if (detailCache.has(req.params.id)) return res.json({ job: detailCache.get(req.params.id), fromCache: true });
+  const cachedDetail = getDetailCache(req.params.id);
+  if (cachedDetail) return res.json({ job: cachedDetail, fromCache: true });
   const enriched = await enrichJobDetail(base);
-  detailCache.set(req.params.id, enriched);
+  detailCache.set(req.params.id, { job: enriched, timestamp: Date.now() });
   jobStore.set(req.params.id, enriched);
   res.json({ job: enriched, fromCache: false });
 });
@@ -776,10 +797,10 @@ app.get('/api/stats', async (req, res) => {
 
   if (needChina) {
     promises.push(
-      withCache('tencent', () => fetchTencentJobs(kw)),
-      withCache('baidu', () => fetchBaiduJobs(kw)),
-      withCache('huawei', () => fetchHuaweiJobs(kw)),
-      withCache('bytedance', () => fetchByteDanceJobs(kw)),
+      withCache(`tencent:${kw}`, () => fetchTencentJobs(kw)),
+      withCache(`baidu:${kw}`, () => fetchBaiduJobs(kw)),
+      withCache(`huawei:${kw}`, () => fetchHuaweiJobs(kw)),
+      withCache(`bytedance:${kw}`, () => fetchByteDanceJobs(kw)),
       withCache('kimi', () => fetchGreenhouseJobs({ name: 'Kimi(月之暗面)', greenhouse: 'moonshot', type: '大模型', logo: '' })),
       withCache('minimax', fetchMiniMaxJobs),
       withCache('deepseek', fetchDeepSeekJobs),
@@ -809,6 +830,13 @@ app.get('/api/stats', async (req, res) => {
   // 过滤游戏 + 清理部门
   allJobs = filterGameJobs(allJobs);
   cleanDepartments(allJobs);
+  if (kw) {
+    const query = kw.toLowerCase().trim();
+    allJobs = allJobs.filter(job => [
+      job.title, job.department, job.location, job.description,
+      job.requirement, job.responsibility,
+    ].filter(Boolean).join(' ').toLowerCase().includes(query));
+  }
 
   // 1. 公司招聘数量排名
   const companyCount = {};
