@@ -674,6 +674,50 @@ function cleanKeyword(kw) {
   return (kw || '').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 64);
 }
 
+// ============ AI 相关性过滤 ============
+// 标题强 AI 信号：命中直接保留（同时豁免功能黑名单，如"AI解决方案销售工程师"）
+// 注意 AI/ML/CV 等缩写必须带词边界，否则会误匹配 maintain 等普通单词
+const AI_TITLE_STRONG = /大模型|\bLLM?s?\b|\bGPT|生成式|AIGC|机器学习|深度学习|强化学习|神经网络|\bML\b|自然语言|\bNLP\b|计算机视觉|\bCV\b|多模态|Multimodal|扩散模型|Diffusion|Transformer|预训练|后训练|微调|Fine-?tun|RLHF|对齐|数据挖掘|推荐系统|推荐算法|数据科学|Data Science|Data Scientist|Research|研究员|科研|科学家|Scientist|智能体|(AI|LLM|Multi)[- ]?Agent|RAG|Prompt工程|具身|Embodied|机器人|Robotics|自动驾驶|智能驾驶|Autonomous|芯片|GPU|算力|推理引擎|Inference|CUDA|Tensor|PyTorch|TensorFlow|语音|Speech|\bTTS\b|\bASR\b|Foundation Model|\bAI\b|Artificial Intelligence/i;
+// 功能黑名单：行政/销售/财务等与 AI 技术无关的职能岗
+const FUNCTION_BLACKLIST = /行政|前台|总务|后勤|法务|律师|Legal|Paralegal|合规|Compliance|财务|会计|审计|税务|\bTax\b|Finance|Accounting|人力资源|\bHR\b|人事|招聘|Recruiter|Recruiting|Talent Acquisition|People Partner|销售|Sales|客户成功|Customer Success|客服|客户支持|Customer Support|客户经理|Account Manager|Account Executive|商务拓展|Business Development|\bBD\b|市场|Marketing|品牌|Brand|公关|Communications|政府事务|Public Policy|Policy|投放|广告运营|采购|Procurement|供应链|Supply Chain|物流|Logistics|仓储|Warehouse|制造|Manufacturing|工厂|质检|质量|QHSE|EHS|保安|司机|Driver|厨师|保洁|秘书|Executive Assistant|保险|店员|导购|出纳|电商|直播|短视频|内容运营|社区运营|用户运营|商家|商户|行业运营|品类|Category|Community|合作伙伴|Partnership|Go-?to-?Market|\bGTM\b|Business Operations|BizOps|Revenue Operations/i;
+// 通用技术/产品/设计职能：黑名单外的职能岗，需按公司类型或描述判定相关性
+const TECH_ROLE = /工程师|Engineer|Developer|开发|架构师|Architect|SRE|DevOps|运维|Backend|Frontend|Full[- ]?Stack|全栈|后端|前端|客户端|移动端|iOS|Android|嵌入式|Embedded|测试|\bQA\b|安全|Security|基础设施|Infrastructure|Platform|平台|技术|Technical|数据|Data|产品|Product|设计|Design|UX|\bUI\b|写作|Writer|编辑|Editor|分析|Analyst|经理|Manager|Lead|负责人|总监|Director|Head|专家|Specialist|咨询|Consultant|实习|Intern|校招/i;
+// 核心技术岗：混合型公司（腾讯/字节/Databricks 等）只保留这类岗位，
+// 通用职能岗（产品/运营/专家/经理）必须有标题级 AI 信号才保留
+const TECH_CORE = /工程师|Engineer|Developer|开发|架构师|Architect|SRE|DevOps|运维|Backend|Frontend|Full[- ]?Stack|全栈|后端|前端|客户端|移动端|iOS|Android|嵌入式|Embedded|测试|\bQA\b|安全|Security|数据|Data|技术|Technical|研发|基础设施|Infrastructure|Platform/i;
+// 纯 AI 公司：其技术/产品/设计职能岗默认与 AI 相关，无需描述佐证
+// （不含"大模型/互联网"这类混合类型，如腾讯/字节仍需描述佐证）
+const PURE_AI_COMPANY_TYPE = /^(大模型|AIGC.*|AI搜索|AI翻译|语音AI|AI芯片.*|AI基础设施)$/;
+// 描述中的 AI 信号：混合型公司（腾讯/字节/Databricks 等）的职能岗以此判定
+const AI_DESC = /\bAI\b|\bAGI\b|\bML\b|machine learning|deep learning|artificial intelligence|large language|\bLLM|\bGPT|generative|gen-?ai|foundation model|neural|PyTorch|TensorFlow|recommendation|computer vision|\bNLP\b|语音识别|语音合成|计算机视觉|大模型|机器学习|深度学习|强化学习|算法|模型训练|模型推理|智能化|智能体|数据挖掘/i;
+
+function isAiRelevantJob(job) {
+  const title = job.title || '';
+  const titleText = `${title} ${job.department || ''}`;
+  if (AI_TITLE_STRONG.test(title)) return true;
+  if (FUNCTION_BLACKLIST.test(titleText)) return false;
+  const pure = PURE_AI_COMPANY_TYPE.test(job.companyType || '');
+  if (pure) {
+    // 纯 AI 公司：技术/产品/设计等职能岗默认保留
+    return TECH_ROLE.test(titleText);
+  }
+  // 混合型公司：仅核心技术岗保留（通用职能岗需标题级 AI 信号，已在上方强信号分支处理）
+  if (!TECH_CORE.test(titleText)) return false;
+  const desc = `${job.description || ''} ${job.requirement || ''}`;
+  if (!desc.trim()) return true;
+  return AI_DESC.test(desc);
+}
+
+// 职位分类（供前端类别筛选）
+function classifyJobCategory(job) {
+  const t = `${job.title || ''} ${job.department || ''}`;
+  if (/产品经理|Product Manager|产品总监|产品运营/i.test(t)) return '产品';
+  if (/算法|研究员|Research|Scientist|科学家|机器学习|深度学习|\bAI\b|大模型|\bLLM\b|数据科学|Data Science|\bNLP\b|计算机视觉|多模态/i.test(t)) return '算法/研究';
+  if (/工程师|Engineer|Developer|开发|架构师|Architect|SRE|DevOps|运维|测试|\bQA\b|安全|Security|数据工程|Data Engineer|芯片|硬件|Hardware/i.test(t)) return '工程技术';
+  if (/设计|Design|UX|\bUI\b|视觉/i.test(t)) return '设计';
+  return '其他';
+}
+
 function filterGameJobs(jobs) {
   return jobs.filter(job => {
     const text = `${job.title} ${job.department} ${job.description}`;
@@ -744,9 +788,11 @@ app.get('/api/jobs/all', async (req, res) => {
     return new Date(b.updatedAt) - new Date(a.updatedAt);
   });
 
-  // 过滤游戏相关职位 + 清理部门标签
+  // 过滤游戏相关职位 + AI 相关性过滤 + 清理部门标签
   allJobs = filterGameJobs(allJobs);
+  allJobs = allJobs.filter(isAiRelevantJob);
   cleanDepartments(allJobs);
+  allJobs.forEach(job => { job.jobCategory = classifyJobCategory(job); });
   if (keyword) {
     const query = keyword.toLowerCase().trim();
     allJobs = allJobs.filter(job => [
@@ -954,9 +1000,11 @@ app.get('/api/stats', async (req, res) => {
   else if (source === 'overseas') allJobs = allJobs.filter(j => overseasCompanyNames.includes(j.company));
   if (company) allJobs = allJobs.filter(j => j.company === company);
 
-  // 过滤游戏 + 清理部门
+  // 过滤游戏 + AI 相关性过滤 + 清理部门
   allJobs = filterGameJobs(allJobs);
+  allJobs = allJobs.filter(isAiRelevantJob);
   cleanDepartments(allJobs);
+  allJobs.forEach(job => { job.jobCategory = classifyJobCategory(job); });
   if (kw) {
     const query = kw.toLowerCase().trim();
     allJobs = allJobs.filter(job => [

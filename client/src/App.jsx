@@ -205,6 +205,7 @@ function App() {
   const [selectedJob, setSelectedJob] = useState(null) // 详情页状态
   const [detailLoading, setDetailLoading] = useState(false) // 详情加载中
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE) // 分页展示数量
+  const [selectedCategory, setSelectedCategory] = useState('') // 岗位类别筛选（客户端过滤）
   const detailRequestId = useRef(0)
 
   // 带超时的 fetch：默认 15s；首次全量爬取较慢的列表/统计接口用 timeoutMs 放宽
@@ -258,6 +259,12 @@ function App() {
   const fetchJobsRef = useRef(fetchJobs)
   useEffect(() => { fetchJobsRef.current = fetchJobs })
   useEffect(() => { fetchJobsRef.current() }, [selectedSource, selectedCompany])
+
+  // 岗位类别切换时重置分页
+  useEffect(() => { setVisibleCount(PAGE_SIZE) }, [selectedCategory])
+
+  // 按类别过滤后的列表（类别筛选在客户端完成，无需重新请求）
+  const filteredJobs = selectedCategory ? jobs.filter(j => j.jobCategory === selectedCategory) : jobs
 
   // 点击卡片：先展示基本信息，再按需从官网抓取完整详情
   const openJobDetail = useCallback(async (job) => {
@@ -329,6 +336,14 @@ function App() {
             <option value="overseas">海外厂商</option>
             <option value="all">全部</option>
           </select>
+          <select value={selectedCategory} onChange={e => setSelectedCategory(e.target.value)} className="select-input">
+            <option value="">全部岗位</option>
+            <option value="算法/研究">算法/研究</option>
+            <option value="工程技术">工程技术</option>
+            <option value="产品">产品</option>
+            <option value="设计">设计</option>
+            <option value="其他">其他</option>
+          </select>
           <button type="submit" className="search-btn" disabled={loading || statsLoading}>
             {loading || statsLoading ? '加载中...' : '搜索'}
           </button>
@@ -355,10 +370,11 @@ function App() {
             <span>共 <strong>{totalCount}</strong> 个职位</span>
             <span>🇨🇳 国内 <strong>{sourceCount.china}</strong></span>
             <span>🌍 海外 <strong>{sourceCount.overseas}</strong></span>
+            {selectedCategory && <span>📂 {selectedCategory} <strong>{filteredJobs.length}</strong>（按类别过滤）</span>}
           </div>
-          {jobs.length === 0 && !error && <div className="empty-state"><p>暂无匹配的职位</p></div>}
+          {filteredJobs.length === 0 && !error && <div className="empty-state"><p>暂无匹配的职位</p></div>}
           <div className="jobs-grid">
-            {jobs.slice(0, visibleCount).map(job => (
+            {filteredJobs.slice(0, visibleCount).map(job => (
               <div key={job.id} className="job-card" onClick={() => openJobDetail(job)} style={{cursor:'pointer'}}>
                 <div className="job-card-header">
                   <img className="job-logo-img" src={job.logo} alt="" onError={(e) => { e.target.style.display = 'none' }} />
@@ -381,10 +397,10 @@ function App() {
               </div>
             ))}
           </div>
-          {jobs.length > visibleCount && (
+          {filteredJobs.length > visibleCount && (
             <div className="load-more-wrap">
               <button className="load-more-btn" onClick={() => setVisibleCount(n => n + PAGE_SIZE)}>
-                加载更多（已显示 {visibleCount} / {jobs.length}）
+                加载更多（已显示 {visibleCount} / {filteredJobs.length}）
               </button>
             </div>
           )}
