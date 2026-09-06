@@ -6,7 +6,7 @@
 
 ## 功能特性
 
-- **多源数据聚合**：接入 DeepSeek、Kimi、MiniMax、智谱AI、腾讯、百度、阿里千问、华为、OpenAI、Anthropic 等 20+ 家 AI 公司
+- **多源数据聚合**：接入 DeepSeek、Kimi、MiniMax、智谱AI、腾讯、百度、阿里千问、华为、OpenAI、Anthropic 等 30+ 家 AI 公司
 - **实时数据获取**：通过官方 API 和 Puppeteer 爬虫实时获取各公司官网招聘数据
 - **智能过滤**：自动过滤游戏等非 AI 相关职位，聚焦 AI 领域
 - **二级详情页**：点击职位卡片查看完整信息（职责、要求、学历、经验、技能标签）
@@ -97,11 +97,11 @@ ai-jobs-finder/
 
 ## 支持的公司
 
-### 国内（10 家）
-DeepSeek、Kimi(月之暗面)、MiniMax、智谱AI(GLM)、阿里千问、小米、字节跳动、腾讯、百度、华为
+### 国内（12 家）
+DeepSeek、Kimi(月之暗面)、MiniMax、智谱AI(GLM)、阿里千问、零一万物(Yi)、生数科技(Vidu)、小米、字节跳动、腾讯、百度、华为
 
-### 海外（10 家）
-OpenAI、Anthropic、xAI、Databricks、Scale AI、Cohere、Perplexity、DeepL、Stability AI、Runway
+### 海外（19 家）
+OpenAI、Anthropic、xAI、Databricks、Scale AI、Cohere、Perplexity、DeepL、Stability AI、Runway、SambaNova、Lightning AI、AssemblyAI、Cerebras、ElevenLabs、Midjourney、Cartesia、Suno、Baseten
 
 ## API 接口
 
@@ -128,7 +128,7 @@ OpenAI、Anthropic、xAI、Databricks、Scale AI、Cohere、Perplexity、DeepL�
 - **首页一直加载中 / 提示获取数据失败**
   确认后端已启动（`npm run server`），且浏览器控制台无跨域报错。前端 dev 模式通过 Vite 代理访问 3001 端口。
 - **国内厂商职位为空**
-  部分公司（华为、字节跳动、小米）官网反爬较强，可能间歇性失败；空结果只缓存 2 分钟，稍后刷新即可。海外厂商（Greenhouse/Ashby API）最稳定。
+  百度因官网强制登录暂无数据；华为走第三方渠道，可能间歇性为空；其余厂商若爬取失败，空结果只缓存 2 分钟，稍后刷新即可。海外厂商（Greenhouse/Ashby API）最稳定。
 - **报错找不到 Chrome**
   通过环境变量指定：`CHROME_PATH="C:\path\to\chrome.exe" npm run server`。
 - **端口被占用**
@@ -141,6 +141,18 @@ OpenAI、Anthropic、xAI、Databricks、Scale AI、Cohere、Perplexity、DeepL�
 - 所有数据实时抓取自各公司公开招聘渠道，仅供个人求职参考，具体以各公司官网为准
 - 请合理使用，避免对目标网站造成过大压力
 - 服务端对抓取到的 URL 做了 SSRF 防护（仅允许公网 http/https 地址）
+
+### 各厂商适配说明
+
+| 厂商 | 接入方式 | 状态 |
+|------|----------|------|
+| 腾讯、字节跳动 | 官方 API（腾讯分页抓取；字节经浏览器 CSRF 令牌调用） | 稳定 |
+| OpenAI、Anthropic 等 19 家海外厂商 | Greenhouse / Ashby 官方 API | 稳定 |
+| MiniMax、智谱AI、零一万物、生数科技 | 飞书招聘页面（新旧两版模板均已适配） | 稳定 |
+| DeepSeek | Moka 招聘页面 | 稳定 |
+| 阿里千问、小米 | 官网页面抓取 | 基本稳定 |
+| 华为 | 第三方渠道（猎聘） | 不稳定，可能为空 |
+| 百度 | — | 官网已强制登录且有自动化检测，暂无法获取 |
 
 ## License
 
