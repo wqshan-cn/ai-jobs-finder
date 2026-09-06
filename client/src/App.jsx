@@ -176,7 +176,12 @@ function extractSkills(text) {
   const found = []
   const lowerText = text.toLowerCase()
   for (const skill of AI_SKILLS) {
-    if (lowerText.includes(skill.toLowerCase()) && !found.includes(skill)) {
+    if (found.includes(skill)) continue
+    if (skill.length <= 3) {
+      // 短技能名（R、Go、C++ 等）按词边界匹配，避免命中普通单词中的字母
+      const escaped = skill.replace(/[+]/g, '\\+')
+      if (new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)) found.push(skill)
+    } else if (lowerText.includes(skill.toLowerCase())) {
       found.push(skill)
     }
   }
@@ -202,12 +207,13 @@ function App() {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE) // 分页展示数量
   const detailRequestId = useRef(0)
 
-  // 带 15s 超时的 fetch，避免后端卡死时前端无限等待
+  // 带超时的 fetch：默认 15s；首次全量爬取较慢的列表/统计接口用 timeoutMs 放宽
   const fetchJSON = useCallback(async (url, options = {}) => {
+    const { timeoutMs = 15000, ...fetchOptions } = options
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 15000)
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
-      const res = await fetch(url, { ...options, signal: controller.signal })
+      const res = await fetch(url, { ...fetchOptions, signal: controller.signal })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       return await res.json()
     } finally {
@@ -226,7 +232,7 @@ function App() {
       if (keyword) params.set('keyword', keyword)
       if (selectedCompany) params.set('company', selectedCompany)
       params.set('source', selectedSource)
-      const data = await fetchJSON(`${API_BASE}/jobs/all?${params}`)
+      const data = await fetchJSON(`${API_BASE}/jobs/all?${params}`, { timeoutMs: 180000 })
       setJobs(data.jobs || [])
       setTotalCount(data.total || 0)
       setSourceCount(data.sources || { china: 0, overseas: 0 })
@@ -243,7 +249,7 @@ function App() {
       if (selectedCompany) params.set('company', selectedCompany)
       params.set('source', selectedSource)
       const qs = params.toString()
-      setStats(await fetchJSON(`${API_BASE}/stats${qs ? '?' + qs : ''}`))
+      setStats(await fetchJSON(`${API_BASE}/stats${qs ? '?' + qs : ''}`, { timeoutMs: 180000 }))
     } catch { setError('获取统计数据失败') }
     finally { setStatsLoading(false) }
   }, [keyword, selectedCompany, selectedSource, fetchJSON])
@@ -280,9 +286,20 @@ function App() {
       setSelectedCompany('')
     }
   }
-  const switchTab = (tab) => { setActiveTab(tab); if (tab === 'stats') fetchStats() }
+  const switchTab = (tab) => {
+    setActiveTab(tab)
+    if (tab === 'stats') fetchStats()
+    else fetchJobs() // 切回列表时用当前筛选条件刷新，避免展示过期结果
+  }
 
-  const formatDate = (d) => { if (!d) return ''; try { return new Date(d).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) } catch { return '' } }
+  const formatDate = (d) => {
+    if (!d) return ''
+    try {
+      const date = new Date(d)
+      if (isNaN(date.getTime())) return '' // 非法日期直接隐藏（V8 的 toLocaleDateString 返回 "Invalid Date" 字符串而不抛错）
+      return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
+    } catch { return '' }
+  }
 
   // 词云颜色
   const wordCloudColors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12', '#1abc9c', '#e67e22', '#34495e']
