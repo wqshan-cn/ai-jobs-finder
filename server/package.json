@@ -1,15 +1,19 @@
 {
-  "name": "server",
+  "name": "ai-jobs-finder-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "AI Jobs Finder 后端服务（API + 官网爬虫 + 缓存）",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": ["ai", "jobs", "recruitment", "scraper"],
+  "author": "wqshan-cn",
+  "license": "MIT",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "cors": "^2.8.6",
     "express": "^5.2.1",

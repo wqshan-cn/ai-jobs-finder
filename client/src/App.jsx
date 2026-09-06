@@ -109,19 +109,23 @@ const LEVEL_PREFIXES = {
   'Chief': '首席', 'Executive': '执行',
 }
 
+// 完整词组按长度降序只排一次（模块级缓存，避免每次渲染重排）
+const SORTED_TRANSLATIONS = Object.entries(TITLE_TRANSLATIONS).sort((a, b) => b[0].length - a[0].length)
+const LOWERED_TRANSLATIONS = SORTED_TRANSLATIONS.map(([en, zh]) => [en.toLowerCase(), zh])
+
 function translateTitle(title) {
   if (!title) return ''
   // 1. 先尝试完整匹配（最长匹配优先）
-  const sortedEntries = Object.entries(TITLE_TRANSLATIONS).sort((a, b) => b[0].length - a[0].length)
-  for (const [en, zh] of sortedEntries) {
-    if (title.toLowerCase().includes(en.toLowerCase())) return zh
+  const lowerTitle = title.toLowerCase()
+  for (const [en, zh] of LOWERED_TRANSLATIONS) {
+    if (lowerTitle.includes(en)) return zh
   }
   // 2. 尝试提取核心职位词翻译
   const words = title.replace(/[^a-zA-Z\s]/g, '').split(/\s+/).filter(w => w.length > 2)
   for (const word of words) {
     if (LEVEL_PREFIXES[word]) continue // 跳过级别前缀
-    for (const [en, zh] of sortedEntries) {
-      if (en.toLowerCase() === word.toLowerCase()) return zh
+    for (const [en, zh] of LOWERED_TRANSLATIONS) {
+      if (en === word.toLowerCase()) return zh
     }
   }
   return ''
@@ -180,6 +184,7 @@ function extractSkills(text) {
 }
 
 function App() {
+  const PAGE_SIZE = 30
   const [jobs, setJobs] = useState([])
   const [loading, setLoading] = useState(false)
   const [keyword, setKeyword] = useState('')
@@ -194,11 +199,25 @@ function App() {
   const [sourceCount, setSourceCount] = useState({ china: 0, overseas: 0 })
   const [selectedJob, setSelectedJob] = useState(null) // 详情页状态
   const [detailLoading, setDetailLoading] = useState(false) // 详情加载中
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE) // 分页展示数量
   const detailRequestId = useRef(0)
 
-  useEffect(() => {
-    fetch(`${API_BASE}/companies`).then(r => r.json()).then(d => setCompanies(d.companies || [])).catch(() => {})
+  // 带 15s 超时的 fetch，避免后端卡死时前端无限等待
+  const fetchJSON = useCallback(async (url, options = {}) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15000)
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return await res.json()
+    } finally {
+      clearTimeout(timer)
+    }
   }, [])
+
+  useEffect(() => {
+    fetchJSON(`${API_BASE}/companies`).then(d => setCompanies(d.companies || [])).catch(() => {})
+  }, [fetchJSON])
 
   const fetchJobs = useCallback(async () => {
     setLoading(true); setError('')
@@ -207,15 +226,14 @@ function App() {
       if (keyword) params.set('keyword', keyword)
       if (selectedCompany) params.set('company', selectedCompany)
       params.set('source', selectedSource)
-      const res = await fetch(`${API_BASE}/jobs/all?${params}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
+      const data = await fetchJSON(`${API_BASE}/jobs/all?${params}`)
       setJobs(data.jobs || [])
       setTotalCount(data.total || 0)
       setSourceCount(data.sources || { china: 0, overseas: 0 })
+      setVisibleCount(PAGE_SIZE)
     } catch { setError('获取数据失败，请确保后端已启动') }
     finally { setLoading(false) }
-  }, [keyword, selectedCompany, selectedSource])
+  }, [keyword, selectedCompany, selectedSource, fetchJSON])
 
   const fetchStats = useCallback(async () => {
     setStatsLoading(true)
@@ -225,14 +243,15 @@ function App() {
       if (selectedCompany) params.set('company', selectedCompany)
       params.set('source', selectedSource)
       const qs = params.toString()
-      const res = await fetch(`${API_BASE}/stats${qs ? '?' + qs : ''}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setStats(await res.json())
+      setStats(await fetchJSON(`${API_BASE}/stats${qs ? '?' + qs : ''}`))
     } catch { setError('获取统计数据失败') }
     finally { setStatsLoading(false) }
-  }, [keyword, selectedCompany, selectedSource])
+  }, [keyword, selectedCompany, selectedSource, fetchJSON])
 
-  useEffect(() => { fetchJobs() }, [])
+  // 挂载时加载 + 公司/数据源变化时自动查询；关键词需手动搜索，避免逐键触发请求
+  const fetchJobsRef = useRef(fetchJobs)
+  useEffect(() => { fetchJobsRef.current = fetchJobs })
+  useEffect(() => { fetchJobsRef.current() }, [selectedSource, selectedCompany])
 
   // 点击卡片：先展示基本信息，再按需从官网抓取完整详情
   const openJobDetail = useCallback(async (job) => {
@@ -322,7 +341,7 @@ function App() {
           </div>
           {jobs.length === 0 && !error && <div className="empty-state"><p>暂无匹配的职位</p></div>}
           <div className="jobs-grid">
-            {jobs.map(job => (
+            {jobs.slice(0, visibleCount).map(job => (
               <div key={job.id} className="job-card" onClick={() => openJobDetail(job)} style={{cursor:'pointer'}}>
                 <div className="job-card-header">
                   <img className="job-logo-img" src={job.logo} alt="" onError={(e) => { e.target.style.display = 'none' }} />
@@ -345,6 +364,13 @@ function App() {
               </div>
             ))}
           </div>
+          {jobs.length > visibleCount && (
+            <div className="load-more-wrap">
+              <button className="load-more-btn" onClick={() => setVisibleCount(n => n + PAGE_SIZE)}>
+                加载更多（已显示 {visibleCount} / {jobs.length}）
+              </button>
+            </div>
+          )}
         </div>
       )}
 
