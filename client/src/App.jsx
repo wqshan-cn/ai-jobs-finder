@@ -109,19 +109,23 @@ const LEVEL_PREFIXES = {
   'Chief': '首席', 'Executive': '执行',
 }
 
+// 完整词组按长度降序只排一次（模块级缓存，避免每次渲染重排）
+const SORTED_TRANSLATIONS = Object.entries(TITLE_TRANSLATIONS).sort((a, b) => b[0].length - a[0].length)
+const LOWERED_TRANSLATIONS = SORTED_TRANSLATIONS.map(([en, zh]) => [en.toLowerCase(), zh])
+
 function translateTitle(title) {
   if (!title) return ''
   // 1. 先尝试完整匹配（最长匹配优先）
-  const sortedEntries = Object.entries(TITLE_TRANSLATIONS).sort((a, b) => b[0].length - a[0].length)
-  for (const [en, zh] of sortedEntries) {
-    if (title.toLowerCase().includes(en.toLowerCase())) return zh
+  const lowerTitle = title.toLowerCase()
+  for (const [en, zh] of LOWERED_TRANSLATIONS) {
+    if (lowerTitle.includes(en)) return zh
   }
   // 2. 尝试提取核心职位词翻译
   const words = title.replace(/[^a-zA-Z\s]/g, '').split(/\s+/).filter(w => w.length > 2)
   for (const word of words) {
     if (LEVEL_PREFIXES[word]) continue // 跳过级别前缀
-    for (const [en, zh] of sortedEntries) {
-      if (en.toLowerCase() === word.toLowerCase()) return zh
+    for (const [en, zh] of LOWERED_TRANSLATIONS) {
+      if (en === word.toLowerCase()) return zh
     }
   }
   return ''
@@ -172,7 +176,12 @@ function extractSkills(text) {
   const found = []
   const lowerText = text.toLowerCase()
   for (const skill of AI_SKILLS) {
-    if (lowerText.includes(skill.toLowerCase()) && !found.includes(skill)) {
+    if (found.includes(skill)) continue
+    if (skill.length <= 3) {
+      // 短技能名（R、Go、C++ 等）按词边界匹配，避免命中普通单词中的字母
+      const escaped = skill.replace(/[+]/g, '\\+')
+      if (new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)) found.push(skill)
+    } else if (lowerText.includes(skill.toLowerCase())) {
       found.push(skill)
     }
   }
@@ -180,6 +189,7 @@ function extractSkills(text) {
 }
 
 function App() {
+  const PAGE_SIZE = 30
   const [jobs, setJobs] = useState([])
   const [loading, setLoading] = useState(false)
   const [keyword, setKeyword] = useState('')
@@ -194,11 +204,27 @@ function App() {
   const [sourceCount, setSourceCount] = useState({ china: 0, overseas: 0 })
   const [selectedJob, setSelectedJob] = useState(null) // 详情页状态
   const [detailLoading, setDetailLoading] = useState(false) // 详情加载中
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE) // 分页展示数量
+  const [selectedCategory, setSelectedCategory] = useState('') // 岗位类别筛选（客户端过滤）
   const detailRequestId = useRef(0)
 
-  useEffect(() => {
-    fetch(`${API_BASE}/companies`).then(r => r.json()).then(d => setCompanies(d.companies || [])).catch(() => {})
+  // 带超时的 fetch：默认 15s；首次全量爬取较慢的列表/统计接口用 timeoutMs 放宽
+  const fetchJSON = useCallback(async (url, options = {}) => {
+    const { timeoutMs = 15000, ...fetchOptions } = options
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const res = await fetch(url, { ...fetchOptions, signal: controller.signal })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return await res.json()
+    } finally {
+      clearTimeout(timer)
+    }
   }, [])
+
+  useEffect(() => {
+    fetchJSON(`${API_BASE}/companies`).then(d => setCompanies(d.companies || [])).catch(() => {})
+  }, [fetchJSON])
 
   const fetchJobs = useCallback(async () => {
     setLoading(true); setError('')
@@ -207,15 +233,14 @@ function App() {
       if (keyword) params.set('keyword', keyword)
       if (selectedCompany) params.set('company', selectedCompany)
       params.set('source', selectedSource)
-      const res = await fetch(`${API_BASE}/jobs/all?${params}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
+      const data = await fetchJSON(`${API_BASE}/jobs/all?${params}`, { timeoutMs: 180000 })
       setJobs(data.jobs || [])
       setTotalCount(data.total || 0)
       setSourceCount(data.sources || { china: 0, overseas: 0 })
+      setVisibleCount(PAGE_SIZE)
     } catch { setError('获取数据失败，请确保后端已启动') }
     finally { setLoading(false) }
-  }, [keyword, selectedCompany, selectedSource])
+  }, [keyword, selectedCompany, selectedSource, fetchJSON])
 
   const fetchStats = useCallback(async () => {
     setStatsLoading(true)
@@ -225,14 +250,21 @@ function App() {
       if (selectedCompany) params.set('company', selectedCompany)
       params.set('source', selectedSource)
       const qs = params.toString()
-      const res = await fetch(`${API_BASE}/stats${qs ? '?' + qs : ''}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setStats(await res.json())
+      setStats(await fetchJSON(`${API_BASE}/stats${qs ? '?' + qs : ''}`, { timeoutMs: 180000 }))
     } catch { setError('获取统计数据失败') }
     finally { setStatsLoading(false) }
-  }, [keyword, selectedCompany, selectedSource])
+  }, [keyword, selectedCompany, selectedSource, fetchJSON])
 
-  useEffect(() => { fetchJobs() }, [])
+  // 挂载时加载 + 公司/数据源变化时自动查询；关键词需手动搜索，避免逐键触发请求
+  const fetchJobsRef = useRef(fetchJobs)
+  useEffect(() => { fetchJobsRef.current = fetchJobs })
+  useEffect(() => { fetchJobsRef.current() }, [selectedSource, selectedCompany])
+
+  // 岗位类别切换时重置分页
+  useEffect(() => { setVisibleCount(PAGE_SIZE) }, [selectedCategory])
+
+  // 按类别过滤后的列表（类别筛选在客户端完成，无需重新请求）
+  const filteredJobs = selectedCategory ? jobs.filter(j => j.jobCategory === selectedCategory) : jobs
 
   // 点击卡片：先展示基本信息，再按需从官网抓取完整详情
   const openJobDetail = useCallback(async (job) => {
@@ -261,9 +293,20 @@ function App() {
       setSelectedCompany('')
     }
   }
-  const switchTab = (tab) => { setActiveTab(tab); if (tab === 'stats') fetchStats() }
+  const switchTab = (tab) => {
+    setActiveTab(tab)
+    if (tab === 'stats') fetchStats()
+    else fetchJobs() // 切回列表时用当前筛选条件刷新，避免展示过期结果
+  }
 
-  const formatDate = (d) => { if (!d) return ''; try { return new Date(d).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) } catch { return '' } }
+  const formatDate = (d) => {
+    if (!d) return ''
+    try {
+      const date = new Date(d)
+      if (isNaN(date.getTime())) return '' // 非法日期直接隐藏（V8 的 toLocaleDateString 返回 "Invalid Date" 字符串而不抛错）
+      return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
+    } catch { return '' }
+  }
 
   // 词云颜色
   const wordCloudColors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12', '#1abc9c', '#e67e22', '#34495e']
@@ -293,6 +336,14 @@ function App() {
             <option value="overseas">海外厂商</option>
             <option value="all">全部</option>
           </select>
+          <select value={selectedCategory} onChange={e => setSelectedCategory(e.target.value)} className="select-input">
+            <option value="">全部岗位</option>
+            <option value="算法/研究">算法/研究</option>
+            <option value="工程技术">工程技术</option>
+            <option value="产品">产品</option>
+            <option value="设计">设计</option>
+            <option value="其他">其他</option>
+          </select>
           <button type="submit" className="search-btn" disabled={loading || statsLoading}>
             {loading || statsLoading ? '加载中...' : '搜索'}
           </button>
@@ -319,10 +370,11 @@ function App() {
             <span>共 <strong>{totalCount}</strong> 个职位</span>
             <span>🇨🇳 国内 <strong>{sourceCount.china}</strong></span>
             <span>🌍 海外 <strong>{sourceCount.overseas}</strong></span>
+            {selectedCategory && <span>📂 {selectedCategory} <strong>{filteredJobs.length}</strong>（按类别过滤）</span>}
           </div>
-          {jobs.length === 0 && !error && <div className="empty-state"><p>暂无匹配的职位</p></div>}
+          {filteredJobs.length === 0 && !error && <div className="empty-state"><p>暂无匹配的职位</p></div>}
           <div className="jobs-grid">
-            {jobs.map(job => (
+            {filteredJobs.slice(0, visibleCount).map(job => (
               <div key={job.id} className="job-card" onClick={() => openJobDetail(job)} style={{cursor:'pointer'}}>
                 <div className="job-card-header">
                   <img className="job-logo-img" src={job.logo} alt="" onError={(e) => { e.target.style.display = 'none' }} />
@@ -345,6 +397,13 @@ function App() {
               </div>
             ))}
           </div>
+          {filteredJobs.length > visibleCount && (
+            <div className="load-more-wrap">
+              <button className="load-more-btn" onClick={() => setVisibleCount(n => n + PAGE_SIZE)}>
+                加载更多（已显示 {visibleCount} / {filteredJobs.length}）
+              </button>
+            </div>
+          )}
         </div>
       )}
 

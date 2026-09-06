@@ -3,15 +3,19 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const puppeteer = require('puppeteer-core');
 const crypto = require('crypto');
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const dns = require('dns').promises;
+const net = require('net');
 
 const app = express();
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
 app.use(cors());
 app.use(express.json());
 
 // 浏览器路径（跨平台自动检测）
-const os = require('os');
 function getChromePath() {
   const platform = os.platform();
   if (platform === 'win32') {
@@ -20,16 +24,83 @@ function getChromePath() {
       'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
       process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
     ];
-    return paths.find(p => require('fs').existsSync(p)) || paths[0];
+    return paths.find(p => fs.existsSync(p)) || paths[0];
   } else if (platform === 'darwin') {
     return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
   } else {
     // Linux
     const paths = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium-browser', '/usr/bin/chromium'];
-    return paths.find(p => require('fs').existsSync(p)) || '/usr/bin/google-chrome';
+    return paths.find(p => fs.existsSync(p)) || '/usr/bin/google-chrome';
   }
 }
 const BROWSER_PATH = process.env.CHROME_PATH || getChromePath();
+if (!fs.existsSync(BROWSER_PATH)) {
+  console.warn(`⚠️  未检测到 Chrome（${BROWSER_PATH}），国内官网抓取将不可用；可通过环境变量 CHROME_PATH 指定路径`);
+}
+
+// ============ SSRF 防护：服务端发起请求前校验目标 URL ============
+// 仅允许 http/https 公网地址，拒绝 localhost、环回、私有与保留地址
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;            // link-local
+    if (a === 172 && b >= 16 && b <= 31) return true;   // 172.16/12
+    if (a === 192 && b === 168) return true;            // 192.168/16
+    if (a === 100 && b >= 64 && b <= 127) return true;  // CGNAT
+    if (a >= 224) return true;                          // 组播/保留
+    return false;
+  }
+  const v6 = ip.toLowerCase();
+  if (v6 === '::' || v6 === '::1') return true;
+  if (v6.startsWith('::ffff:')) return isPrivateIp(v6.slice(7)); // IPv4-mapped
+  if (/^f[cd]/.test(v6)) return true;   // unique local fc00::/7
+  if (v6.startsWith('fe8') || v6.startsWith('fe9') || v6.startsWith('fea') || v6.startsWith('feb')) return true; // link-local
+  return false;
+}
+
+async function assertSafeUrl(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error('非法 URL');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`不允许的协议: ${url.protocol}`);
+  }
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) {
+    if (isPrivateIp(host)) throw new Error('禁止访问内网/保留地址');
+    return url;
+  }
+  if (/^(localhost|.*\.local|.*\.localhost|.*\.internal)$/i.test(host)) {
+    throw new Error('禁止访问内网地址');
+  }
+  const addrs = await dns.lookup(host, { all: true }).catch(() => null);
+  if (!addrs || addrs.length === 0) throw new Error(`域名解析失败: ${host}`);
+  for (const { address } of addrs) {
+    if (isPrivateIp(address)) throw new Error('禁止访问内网/保留地址');
+  }
+  return url;
+}
+
+// 固定官方 API 的 URL 校验：仅允许 https + 指定 host，防止参数拼接导致的请求伪造
+// 拼接进 URL 路径的 ID/Token 必须是无特殊字符的短字符串
+const SAFE_PATH_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+function assertSafeApiUrl(urlString, allowedHost) {
+  let url;
+  try {
+    url = new URL(urlString);
+  } catch {
+    throw new Error('非法 URL');
+  }
+  if (url.protocol !== 'https:' || url.host !== allowedHost) {
+    throw new Error(`不允许的请求目标: ${url.protocol}//${url.host}`);
+  }
+  return urlString;
+}
 
 // ============ 公司配置（国内优先）============
 const COMPANIES = {
@@ -42,8 +113,10 @@ const COMPANIES = {
     { name: '小米', id: 'xiaomi', type: 'AI/智能硬件', logo: 'https://s01.mifile.cn/favicon.ico', career: 'https://hr.xiaomi.com/job' },
     { name: '字节跳动', id: 'bytedance', type: '大模型/互联网', logo: 'https://lf-headquarters.bytescm.com/logo.png', career: 'https://jobs.bytedance.com' },
     { name: '腾讯', id: 'tencent', type: '大模型/互联网', logo: 'https://mat1.gtimg.com/qqcdn/qqindex2021/favicon.ico', career: 'https://careers.tencent.com' },
-    { name: '百度', id: 'baidu', type: '大模型/AI', logo: 'https://www.baidu.com/favicon.ico', career: 'https://talent.baidu.com' },
+    { name: '百度', id: 'baidu', type: '大模型/AI', logo: 'https://www.baidu.com/favicon.ico', career: 'https://talent.baidu.com/jobs/social-list' },
     { name: '华为', id: 'huawei', type: 'AI/芯片', logo: 'https://www.huawei.com/favicon.ico', career: 'https://career.huawei.com' },
+    { name: '零一万物(Yi)', id: '01ai', type: '大模型', logo: 'https://www.01.ai/favicon.ico', career: 'https://01ai.jobs.feishu.cn/index/' },
+    { name: '生数科技(Vidu)', id: 'shengshu', type: 'AIGC/视频', logo: 'https://www.shengshu.ai/favicon.ico', career: 'https://shengshu.jobs.feishu.cn/index/' },
   ],
   greenhouse: [
     { name: 'Anthropic', token: 'anthropic', type: '大模型', logo: 'https://www.anthropic.com/favicon.ico' },
@@ -51,6 +124,9 @@ const COMPANIES = {
     { name: 'Scale AI', token: 'scaleai', type: 'AI基础设施', logo: 'https://scale.com/favicon.ico' },
     { name: 'Stability AI', token: 'stabilityai', type: 'AIGC', logo: 'https://stability.ai/favicon.ico' },
     { name: 'Databricks', token: 'databricks', type: 'AI/数据', logo: 'https://www.databricks.com/favicon.ico' },
+    { name: 'SambaNova', token: 'sambanovasystems', type: 'AI芯片/基础设施', logo: 'https://sambanova.ai/favicon.ico' },
+    { name: 'Lightning AI', token: 'lightningai', type: 'AI基础设施', logo: 'https://lightning.ai/favicon.ico' },
+    { name: 'AssemblyAI', token: 'assemblyai', type: '语音AI', logo: 'https://www.assemblyai.com/favicon.ico' },
   ],
   ashby: [
     { name: 'OpenAI', token: 'openai', type: '大模型', logo: 'https://openai.com/favicon.ico' },
@@ -58,17 +134,24 @@ const COMPANIES = {
     { name: 'Perplexity', token: 'perplexity', type: 'AI搜索', logo: 'https://www.perplexity.ai/favicon.ico' },
     { name: 'DeepL', token: 'deepl', type: 'AI翻译', logo: 'https://www.deepl.com/favicon.ico' },
     { name: 'Runway', token: 'runway', type: 'AIGC/视频', logo: 'https://runwayml.com/favicon.ico' },
+    { name: 'Cerebras', token: 'cerebras', type: 'AI芯片', logo: 'https://www.cerebras.ai/favicon.ico' },
+    { name: 'ElevenLabs', token: 'elevenlabs', type: '语音AI', logo: 'https://elevenlabs.io/favicon.ico' },
+    { name: 'Midjourney', token: 'midjourney', type: 'AIGC/图像', logo: 'https://www.midjourney.com/favicon.ico' },
+    { name: 'Cartesia', token: 'cartesia', type: '语音AI', logo: 'https://cartesia.ai/favicon.ico' },
+    { name: 'Suno', token: 'suno', type: 'AIGC/音乐', logo: 'https://suno.com/favicon.ico' },
+    { name: 'Baseten', token: 'baseten', type: 'AI基础设施', logo: 'https://www.baseten.co/favicon.ico' },
   ],
 };
 
 // ============ 缓存管理 ============
 const CACHE_TTL = 10 * 60 * 1000;
+const EMPTY_CACHE_TTL = 2 * 60 * 1000; // 空结果短缓存，避免失败后每次请求都重爬
 const cache = new Map();
 const DETAIL_CACHE_TTL = 10 * 60 * 1000;
 
 function getCache(key) {
   const entry = cache.get(key);
-  if (entry && (Date.now() - entry.timestamp < CACHE_TTL)) {
+  if (entry && (Date.now() - entry.timestamp < (entry.ttl || CACHE_TTL))) {
     console.log(`[缓存命中] ${key} (${Math.round((Date.now() - entry.timestamp) / 1000)}s前)`);
     return entry.data;
   }
@@ -76,21 +159,33 @@ function getCache(key) {
 }
 
 function setCache(key, data) {
-  cache.set(key, { data, timestamp: Date.now() });
+  cache.set(key, { data, timestamp: Date.now(), ttl: data.length > 0 ? CACHE_TTL : EMPTY_CACHE_TTL });
   console.log(`[缓存写入] ${key} (${data.length} 条)`);
 }
+
+// 进行中的请求去重：并发请求同一个 key 时只触发一次实际抓取，避免同时开多个 Puppeteer 页面
+const inflight = new Map();
 
 async function withCache(key, fetchFn) {
   const cached = getCache(key);
   if (cached !== null) return cached;
-  const data = await fetchFn();
-  if (data && data.length > 0) setCache(key, data);
-  return data;
+  if (inflight.has(key)) return inflight.get(key);
+  const promise = (async () => {
+    try {
+      const data = await fetchFn();
+      if (Array.isArray(data)) setCache(key, data);
+      return data;
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+  inflight.set(key, promise);
+  return promise;
 }
 
 function stableJobId(prefix, ...parts) {
   const value = parts.filter(Boolean).join('|');
-  return `${prefix}_${crypto.createHash('sha1').update(value).digest('hex').slice(0, 16)}`;
+  return `${prefix}_${crypto.createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
 }
 
 // ============ Puppeteer 浏览器管理 ============
@@ -244,6 +339,16 @@ async function fetchDeepSeekJobs() {
 // ============ 智谱AI 抓取（飞书招聘平台）============
 async function fetchZhipuJobs() {
   return fetchFeishuJobs({ url: 'https://zhipu-ai.jobs.feishu.cn/index/', company: '智谱AI(GLM)', companyId: 'zhipu', companyType: '大模型', logo: 'https://www.zhipuai.cn/favicon.ico', maxPages: 15 });
+}
+
+// ============ 零一万物 / 生数科技 抓取（飞书招聘平台·新版模板）============
+// 新版模板职位列表位于 /index/position/list（旧版直接在 /index/ 下）
+async function fetchZeroOneJobs() {
+  return fetchFeishuJobs({ url: 'https://01ai.jobs.feishu.cn/index/position/list', company: '零一万物(Yi)', companyId: '01ai', companyType: '大模型', logo: 'https://www.01.ai/favicon.ico', maxPages: 10 });
+}
+
+async function fetchShengshuJobs() {
+  return fetchFeishuJobs({ url: 'https://shengshu.jobs.feishu.cn/index/position/list', company: '生数科技(Vidu)', companyId: 'shengshu', companyType: 'AIGC/视频', logo: 'https://www.shengshu.ai/favicon.ico', maxPages: 10 });
 }
 
 // ============ 小米抓取 ============
@@ -423,7 +528,7 @@ async function fetchHuaweiJobs2() {
 // ============ Greenhouse API ============
 async function fetchGreenhouseJobs(company) {
   try {
-    const url = `https://boards-api.greenhouse.io/v1/boards/${company.token || company.greenhouse}/jobs`;
+    const url = assertSafeApiUrl(`https://boards-api.greenhouse.io/v1/boards/${company.token || company.greenhouse}/jobs`, 'boards-api.greenhouse.io');
     const res = await fetch(url, { timeout: 20000 });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -442,7 +547,7 @@ async function fetchGreenhouseJobs(company) {
 // ============ Ashby API ============
 async function fetchAshbyJobs(company) {
   try {
-    const url = `https://api.ashbyhq.com/posting-api/job-board/${company.token}`;
+    const url = assertSafeApiUrl(`https://api.ashbyhq.com/posting-api/job-board/${company.token}`, 'api.ashbyhq.com');
     const res = await fetch(url, { timeout: 20000 });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -459,14 +564,20 @@ async function fetchAshbyJobs(company) {
   }
 }
 
-// ============ 腾讯 API ============
+// ============ 腾讯 API（社招，分页抓取） ============
 async function fetchTencentJobs(keyword = '') {
   try {
-    const url = `https://careers.tencent.com/tencentcareer/api/post/Query?timestamp=${Date.now()}&countryId=&cityId=&bgIds=&productId=&categoryId=&parentCategoryId=&attrId=1&keyword=${encodeURIComponent(keyword)}&pageIndex=1&pageSize=100&language=zh-cn&area=cn`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://careers.tencent.com/' }, timeout: 20000 });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return (data?.Data?.Posts || []).map(job => ({
+    const allPosts = [];
+    for (let pageIndex = 1; pageIndex <= 5; pageIndex++) {
+      const url = assertSafeApiUrl(`https://careers.tencent.com/tencentcareer/api/post/Query?timestamp=${Date.now()}&countryId=&cityId=&bgIds=&productId=&categoryId=&parentCategoryId=&attrId=1&keyword=${encodeURIComponent(keyword)}&pageIndex=${pageIndex}&pageSize=100&language=zh-cn&area=cn`, 'careers.tencent.com');
+      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://careers.tencent.com/' }, timeout: 20000 });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const posts = data?.Data?.Posts || [];
+      allPosts.push(...posts);
+      if (posts.length < 100) break;
+    }
+    return allPosts.map(job => ({
       id: `tencent_${job.PostId}`, title: job.RecruitPostName, company: '腾讯', companyType: '大模型/互联网',
       logo: 'https://mat1.gtimg.com/qqcdn/qqindex2021/favicon.ico',
       location: `${job.LocationName || ''}`.trim() || '未知',
@@ -481,62 +592,53 @@ async function fetchTencentJobs(keyword = '') {
   }
 }
 
-// ============ 百度 API ============
-async function fetchBaiduJobs(keyword = '') {
-  try {
-    const url = `https://talent.baidu.com/ht/api/getRecruitPostListNew?recruitType=SOCIAL&pageSize=100&keyWord=${encodeURIComponent(keyword)}&curPage=1`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://talent.baidu.com/jobs/social-list' }, timeout: 20000 });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return (data?.data?.list || []).map(job => ({
-      id: `baidu_${job.id}`, title: job.name, company: '百度', companyType: '大模型/AI',
-      logo: 'https://www.baidu.com/favicon.ico', location: job.city || '未知',
-      url: `https://talent.baidu.com/jobs/social-detail?recruitId=${job.id}`, source: '官网',
-      updatedAt: job.publishTime || '', department: job.department || '',
-      description: (job.desc || '').replace(/<[^>]+>/g, '').slice(0, 300),
-    }));
-  } catch (err) {
-    console.error('[百度]:', err.message);
-    return [];
-  }
-}
+// ============ 百度 ============
+// 官网公开 API 已改为强制登录（返回 need-login），页面端存在 CDP 级自动化检测
+// （headless/有头均被重定向到 about:blank），暂无法获取；公司信息保留用于展示官网入口
+async function fetchBaiduJobs() { return []; }
 
-// ============ 华为 API ============
-async function fetchHuaweiJobs(keyword = '') {
-  try {
-    const res = await fetch('https://career.huawei.com/reccampportal/api/index/getIndexPageRecruitPostList', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://career.huawei.com/reccampportal/portal5/index.html' },
-      body: JSON.stringify({ key: keyword, pageIndex: 1, pageSize: 100, site: 'cn', recruitType: 'social' }),
-      timeout: 20000,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return (data?.data?.list || []).map(job => ({
-      id: `huawei_api_${job.id}`, title: job.name, company: '华为', companyType: 'AI/芯片',
-      logo: 'https://www.huawei.com/favicon.ico', location: job.workPlace || '未知',
-      url: `https://career.huawei.com/reccampportal/portal5/detail.html?id=${job.id}`, source: '官网',
-      updatedAt: job.publishTime || '', department: job.deptName || '',
-      description: (job.description || '').replace(/<[^>]+>/g, '').slice(0, 300),
-    }));
-  } catch (err) {
-    console.error('[华为]:', err.message);
-    return [];
-  }
-}
+// ============ 华为 ============
+// 官网 API 已失效（reccampportal 接口 404），数据改由猎聘第三方渠道获取（见 fetchHuaweiJobs2）
 
-// ============ 字节跳动 API ============
-async function fetchByteDanceJobs(keyword = '') {
+// ============ 字节跳动（Puppeteer 页面上下文调用官方 API）============
+// 流程：先 POST /api/v1/csrf/token 获取令牌（同时种下 atsx-csrf-token cookie），
+// 再带 x-csrf-token 头与查询串调用搜索接口，否则返回 405
+async function fetchByteDanceJobs() {
+  let page = null;
   try {
-    const res = await fetch('https://jobs.bytedance.com/api/v1/search/job/posts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://jobs.bytedance.com/experienced/position' },
-      body: JSON.stringify({ keyword, limit: 100, offset: 0, job_category_id_list: [], location_code_list: [], subject_id_list: [], recruitment_id_list: [], portal_type: 2, portal_entrance: 1 }),
-      timeout: 20000,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return (data?.data?.job_post_list || []).map(job => ({
+    const browser = await getBrowser();
+    page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.goto('https://jobs.bytedance.com/experienced/position?portal_entrance=1', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await new Promise(r => setTimeout(r, 4000));
+    const fetchPage = (offset) => page.evaluate(async (offset) => {
+      // 同源相对路径请求：仅访问当前页面的站点自身 API
+      await fetch('/api/v1/csrf/token', { method: 'POST', credentials: 'include' });
+      const csrf = decodeURIComponent((document.cookie.match(/atsx-csrf-token=([^;]+)/) || [])[1] || '');
+      const body = { keyword: '', limit: 100, offset, job_category_id_list: [], location_code_list: [], subject_id_list: [], recruitment_id_list: [], portal_type: 2, portal_entrance: 1 };
+      const qs = new URLSearchParams({
+        keyword: '', limit: '100', offset: String(offset), job_category_id_list: '', location_code_list: '',
+        subject_id_list: '', recruitment_id_list: '', portal_type: '2', portal_entrance: '1',
+      });
+      const url = '/api/v1/search/job/posts?' + qs.toString();
+      const res = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf },
+        body: JSON.stringify(body),
+      });
+      return res.json();
+    }, offset);
+    const allPosts = [];
+    for (let offset = 0; offset <= 100; offset += 100) {
+      const data = await fetchPage(offset);
+      const posts = data?.data?.job_post_list || [];
+      allPosts.push(...posts);
+      if (posts.length < 100) break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    console.log(`[字节跳动] 页面API获取: ${allPosts.length} 个职位`);
+    return allPosts.map(job => ({
       id: `bytedance_${job.id}`, title: job.title, company: '字节跳动', companyType: '大模型/互联网',
       logo: 'https://lf-headquarters.bytescm.com/logo.png', location: job.city_info?.name || '未知',
       url: `https://jobs.bytedance.com/experienced/position/${job.id}/detail`, source: '官网',
@@ -548,6 +650,8 @@ async function fetchByteDanceJobs(keyword = '') {
   } catch (err) {
     console.error('[字节跳动]:', err.message);
     return [];
+  } finally {
+    if (page) await page.close().catch(() => {});
   }
 }
 
@@ -564,6 +668,55 @@ app.get('/api/companies', (req, res) => {
 // 游戏相关过滤关键词
 const GAME_KEYWORDS = /游戏|Game|Unity|Unreal|关卡|PUBG|和平精英|王者荣耀|英雄联盟|三角洲行动|暗区突围|火影忍者|航海王|龙珠|圣斗士|金铲铲|云顶之弈|无畏契约|Valorant|League of Legends|Fortnite|Apex|Overwatch|CS:GO|Dota|魔兽世界|星际争霸|暴雪|Blizzard|Riot Games|Epic Games|Supercell|Zynga|EA Games|Ubisoft|Capcom|Square Enix|Nintendo|PlayStation|Xbox|Nintendo Switch|Steam|游戏策划|游戏运营|游戏测试|游戏美术|游戏音效|游戏客户端|游戏服务器|游戏引擎|数值策划/i;
 const DEPT_BLACKLIST = ['网游', '游戏', 'IEG', '互动娱乐', '本科', '硕士', '博士', '大专'];
+
+// 关键词净化：去除控制字符并限制长度（用于查询参数与缓存键）
+function cleanKeyword(kw) {
+  return (kw || '').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 64);
+}
+
+// ============ AI 相关性过滤 ============
+// 标题强 AI 信号：命中直接保留（同时豁免功能黑名单，如"AI解决方案销售工程师"）
+// 注意 AI/ML/CV 等缩写必须带词边界，否则会误匹配 maintain 等普通单词
+const AI_TITLE_STRONG = /大模型|\bLLM?s?\b|\bGPT|生成式|AIGC|机器学习|深度学习|强化学习|神经网络|\bML\b|自然语言|\bNLP\b|计算机视觉|\bCV\b|多模态|Multimodal|扩散模型|Diffusion|Transformer|预训练|后训练|微调|Fine-?tun|RLHF|对齐|数据挖掘|推荐系统|推荐算法|数据科学|Data Science|Data Scientist|Research|研究员|科研|科学家|Scientist|智能体|(AI|LLM|Multi)[- ]?Agent|RAG|Prompt工程|具身|Embodied|机器人|Robotics|自动驾驶|智能驾驶|Autonomous|芯片|GPU|算力|推理引擎|Inference|CUDA|Tensor|PyTorch|TensorFlow|语音|Speech|\bTTS\b|\bASR\b|Foundation Model|\bAI\b|Artificial Intelligence/i;
+// 功能黑名单：行政/销售/财务等与 AI 技术无关的职能岗
+const FUNCTION_BLACKLIST = /行政|前台|总务|后勤|法务|律师|Legal|Paralegal|合规|Compliance|财务|会计|审计|税务|\bTax\b|Finance|Accounting|人力资源|\bHR\b|人事|招聘|Recruiter|Recruiting|Talent Acquisition|People Partner|销售|Sales|客户成功|Customer Success|客服|客户支持|Customer Support|客户经理|Account Manager|Account Executive|商务拓展|Business Development|\bBD\b|市场|Marketing|品牌|Brand|公关|Communications|政府事务|Public Policy|Policy|投放|广告运营|采购|Procurement|供应链|Supply Chain|物流|Logistics|仓储|Warehouse|制造|Manufacturing|工厂|质检|质量|QHSE|EHS|保安|司机|Driver|厨师|保洁|秘书|Executive Assistant|保险|店员|导购|出纳|电商|直播|短视频|内容运营|社区运营|用户运营|商家|商户|行业运营|品类|Category|Community|合作伙伴|Partnership|Go-?to-?Market|\bGTM\b|Business Operations|BizOps|Revenue Operations/i;
+// 通用技术/产品/设计职能：黑名单外的职能岗，需按公司类型或描述判定相关性
+const TECH_ROLE = /工程师|Engineer|Developer|开发|架构师|Architect|SRE|DevOps|运维|Backend|Frontend|Full[- ]?Stack|全栈|后端|前端|客户端|移动端|iOS|Android|嵌入式|Embedded|测试|\bQA\b|安全|Security|基础设施|Infrastructure|Platform|平台|技术|Technical|数据|Data|产品|Product|设计|Design|UX|\bUI\b|写作|Writer|编辑|Editor|分析|Analyst|经理|Manager|Lead|负责人|总监|Director|Head|专家|Specialist|咨询|Consultant|实习|Intern|校招/i;
+// 核心技术岗：混合型公司（腾讯/字节/Databricks 等）只保留这类岗位，
+// 通用职能岗（产品/运营/专家/经理）必须有标题级 AI 信号才保留
+const TECH_CORE = /工程师|Engineer|Developer|开发|架构师|Architect|SRE|DevOps|运维|Backend|Frontend|Full[- ]?Stack|全栈|后端|前端|客户端|移动端|iOS|Android|嵌入式|Embedded|测试|\bQA\b|安全|Security|数据|Data|技术|Technical|研发|基础设施|Infrastructure|Platform/i;
+// 纯 AI 公司：其技术/产品/设计职能岗默认与 AI 相关，无需描述佐证
+// （不含"大模型/互联网"这类混合类型，如腾讯/字节仍需描述佐证）
+const PURE_AI_COMPANY_TYPE = /^(大模型|AIGC.*|AI搜索|AI翻译|语音AI|AI芯片.*|AI基础设施)$/;
+// 描述中的 AI 信号：混合型公司（腾讯/字节/Databricks 等）的职能岗以此判定
+const AI_DESC = /\bAI\b|\bAGI\b|\bML\b|machine learning|deep learning|artificial intelligence|large language|\bLLM|\bGPT|generative|gen-?ai|foundation model|neural|PyTorch|TensorFlow|recommendation|computer vision|\bNLP\b|语音识别|语音合成|计算机视觉|大模型|机器学习|深度学习|强化学习|算法|模型训练|模型推理|智能化|智能体|数据挖掘/i;
+
+function isAiRelevantJob(job) {
+  const title = job.title || '';
+  const titleText = `${title} ${job.department || ''}`;
+  if (AI_TITLE_STRONG.test(title)) return true;
+  if (FUNCTION_BLACKLIST.test(titleText)) return false;
+  const pure = PURE_AI_COMPANY_TYPE.test(job.companyType || '');
+  if (pure) {
+    // 纯 AI 公司：技术/产品/设计等职能岗默认保留
+    return TECH_ROLE.test(titleText);
+  }
+  // 混合型公司：仅核心技术岗保留（通用职能岗需标题级 AI 信号，已在上方强信号分支处理）
+  if (!TECH_CORE.test(titleText)) return false;
+  const desc = `${job.description || ''} ${job.requirement || ''}`;
+  if (!desc.trim()) return true;
+  return AI_DESC.test(desc);
+}
+
+// 职位分类（供前端类别筛选）
+function classifyJobCategory(job) {
+  const t = `${job.title || ''} ${job.department || ''}`;
+  if (/产品经理|Product Manager|产品总监|产品运营/i.test(t)) return '产品';
+  if (/算法|研究员|Research|Scientist|科学家|机器学习|深度学习|\bAI\b|大模型|\bLLM\b|数据科学|Data Science|\bNLP\b|计算机视觉|多模态/i.test(t)) return '算法/研究';
+  if (/工程师|Engineer|Developer|开发|架构师|Architect|SRE|DevOps|运维|测试|\bQA\b|安全|Security|数据工程|Data Engineer|芯片|硬件|Hardware/i.test(t)) return '工程技术';
+  if (/设计|Design|UX|\bUI\b|视觉/i.test(t)) return '设计';
+  return '其他';
+}
 
 function filterGameJobs(jobs) {
   return jobs.filter(job => {
@@ -591,16 +744,17 @@ app.get('/api/jobs/all', async (req, res) => {
   const promises = [];
 
   if (needChina) {
-    const kw = keyword || '';
+    const kw = cleanKeyword(keyword);
     let fetchers = [];
     if (!company || company === 'Kimi(月之暗面)') fetchers.push(withCache('kimi', () => fetchGreenhouseJobs({ name: 'Kimi(月之暗面)', greenhouse: 'moonshot', type: '大模型', logo: 'https://kimi.moonshot.cn/favicon.ico' })));
     if (!company || company === '腾讯') fetchers.push(withCache(`tencent:${kw}`, () => fetchTencentJobs(kw)));
-    if (!company || company === '百度') fetchers.push(withCache(`baidu:${kw}`, () => fetchBaiduJobs(kw)));
-    if (!company || company === '华为') fetchers.push(withCache(`huawei:${kw}`, () => fetchHuaweiJobs(kw)));
-    if (!company || company === '字节跳动') fetchers.push(withCache(`bytedance:${kw}`, () => fetchByteDanceJobs(kw)));
+    if (!company || company === '百度') fetchers.push(withCache('baidu', fetchBaiduJobs));
+    if (!company || company === '字节跳动') fetchers.push(withCache('bytedance', fetchByteDanceJobs));
     if (!company || company === 'MiniMax') fetchers.push(withCache('minimax', fetchMiniMaxJobs));
     if (!company || company === 'DeepSeek') fetchers.push(withCache('deepseek', fetchDeepSeekJobs));
     if (!company || company === '智谱AI(GLM)') fetchers.push(withCache('zhipu', fetchZhipuJobs));
+    if (!company || company === '零一万物(Yi)') fetchers.push(withCache('01ai', fetchZeroOneJobs));
+    if (!company || company === '生数科技(Vidu)') fetchers.push(withCache('shengshu', fetchShengshuJobs));
     if (!company || company === '小米') fetchers.push(withCache('xiaomi', fetchXiaomiJobs));
     if (!company || company === '阿里千问') fetchers.push(withCache('qwen', fetchQwenJobs));
     if (!company || company === '华为') fetchers.push(withCache('huawei2', fetchHuaweiJobs2));
@@ -634,9 +788,11 @@ app.get('/api/jobs/all', async (req, res) => {
     return new Date(b.updatedAt) - new Date(a.updatedAt);
   });
 
-  // 过滤游戏相关职位 + 清理部门标签
+  // 过滤游戏相关职位 + AI 相关性过滤 + 清理部门标签
   allJobs = filterGameJobs(allJobs);
+  allJobs = allJobs.filter(isAiRelevantJob);
   cleanDepartments(allJobs);
+  allJobs.forEach(job => { job.jobCategory = classifyJobCategory(job); });
   if (keyword) {
     const query = keyword.toLowerCase().trim();
     allJobs = allJobs.filter(job => [
@@ -645,7 +801,7 @@ app.get('/api/jobs/all', async (req, res) => {
     ].filter(Boolean).join(' ').toLowerCase().includes(query));
   }
 
-  allJobs.forEach(job => { jobStore.set(job.id, job); });
+  allJobs.forEach(job => { rememberJob(job); });
   // 过滤后重新计算来源数量（确保与 total 一致）
   const chinaCompanyNames2 = COMPANIES.china.map(c => c.name);
   const filteredChina = allJobs.filter(j => chinaCompanyNames2.includes(j.company)).length;
@@ -655,7 +811,16 @@ app.get('/api/jobs/all', async (req, res) => {
 
 // 职位详情存储
 const jobStore = new Map();
+const JOB_STORE_MAX = 5000; // 防止长期运行内存无限增长
 const detailCache = new Map();
+
+function rememberJob(job) {
+  if (jobStore.size >= JOB_STORE_MAX) {
+    const oldest = jobStore.keys().next().value;
+    jobStore.delete(oldest);
+  }
+  jobStore.set(job.id, job);
+}
 
 function getDetailCache(id) {
   const entry = detailCache.get(id);
@@ -671,6 +836,7 @@ function getDetailCache(id) {
 async function fetchFeishuJobDetail(url) {
   let page = null;
   try {
+    await assertSafeUrl(url); // URL 来自爬取结果，须校验防止 SSRF
     const browser = await getBrowser();
     page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
@@ -708,7 +874,9 @@ function htmlToText(html) {
 
 async function fetchGreenhouseJobDetail(token, jobId) {
   try {
-    const res = await fetch(`https://boards-api.greenhouse.io/v1/boards/${token}/jobs/${jobId}`, { timeout: 10000 });
+    if (!SAFE_PATH_ID.test(token) || !SAFE_PATH_ID.test(jobId)) throw new Error('非法职位 ID');
+    const url = assertSafeApiUrl(`https://boards-api.greenhouse.io/v1/boards/${token}/jobs/${jobId}`, 'boards-api.greenhouse.io');
+    const res = await fetch(url, { timeout: 10000 });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const text = htmlToText(data.content || '');
@@ -721,7 +889,9 @@ async function fetchGreenhouseJobDetail(token, jobId) {
 
 async function fetchAshbyJobDetail(token, jobId) {
   try {
-    const res = await fetch(`https://api.ashbyhq.com/posting-api/job-board/${token}/${jobId}`, { timeout: 10000 });
+    if (!SAFE_PATH_ID.test(token) || !SAFE_PATH_ID.test(jobId)) throw new Error('非法职位 ID');
+    const url = assertSafeApiUrl(`https://api.ashbyhq.com/posting-api/job-board/${token}/${jobId}`, 'api.ashbyhq.com');
+    const res = await fetch(url, { timeout: 10000 });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const text = htmlToText(data.descriptionHtml || data.description || '');
@@ -734,7 +904,9 @@ async function fetchAshbyJobDetail(token, jobId) {
 
 async function fetchTencentJobDetail(postId) {
   try {
-    const res = await fetch(`https://careers.tencent.com/tencentcareer/api/post/ByPostId?timestamp=${Date.now()}&postId=${postId}&language=zh-cn`, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://careers.tencent.com/' }, timeout: 10000 });
+    if (!SAFE_PATH_ID.test(postId)) throw new Error('非法职位 ID');
+    const url = assertSafeApiUrl(`https://careers.tencent.com/tencentcareer/api/post/ByPostId?timestamp=${Date.now()}&postId=${encodeURIComponent(postId)}&language=zh-cn`, 'careers.tencent.com');
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': 'https://careers.tencent.com/' }, timeout: 10000 });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const post = data?.Data || {};
@@ -753,7 +925,7 @@ async function enrichJobDetail(job) {
   if ((job.responsibility || job.requirement) && (job.description || '').length > 200) return job;
   const id = job.id || '';
   let detail = null;
-  if (id.startsWith('minimax_') || id.startsWith('zhipu_')) {
+  if (id.startsWith('minimax_') || id.startsWith('zhipu_') || id.startsWith('01ai_') || id.startsWith('shengshu_')) {
     detail = await fetchFeishuJobDetail(job.url);
   } else if (id.startsWith('gh_')) {
     const parts = id.split('_');
@@ -790,7 +962,7 @@ app.get('/api/jobs/:id', (req, res) => {
 // ============ 统计 API ============
 app.get('/api/stats', async (req, res) => {
   const { keyword, company, source } = req.query;
-  const kw = keyword || '';
+  const kw = cleanKeyword(keyword);
   const needChina = !source || source === 'all' || source === 'china';
   const needOverseas = !source || source === 'all' || source === 'overseas';
   const promises = [];
@@ -798,13 +970,14 @@ app.get('/api/stats', async (req, res) => {
   if (needChina) {
     promises.push(
       withCache(`tencent:${kw}`, () => fetchTencentJobs(kw)),
-      withCache(`baidu:${kw}`, () => fetchBaiduJobs(kw)),
-      withCache(`huawei:${kw}`, () => fetchHuaweiJobs(kw)),
-      withCache(`bytedance:${kw}`, () => fetchByteDanceJobs(kw)),
+      withCache('baidu', fetchBaiduJobs),
+      withCache('bytedance', fetchByteDanceJobs),
       withCache('kimi', () => fetchGreenhouseJobs({ name: 'Kimi(月之暗面)', greenhouse: 'moonshot', type: '大模型', logo: '' })),
       withCache('minimax', fetchMiniMaxJobs),
       withCache('deepseek', fetchDeepSeekJobs),
       withCache('zhipu', fetchZhipuJobs),
+      withCache('01ai', fetchZeroOneJobs),
+      withCache('shengshu', fetchShengshuJobs),
       withCache('xiaomi', fetchXiaomiJobs),
       withCache('qwen', fetchQwenJobs),
       withCache('huawei2', fetchHuaweiJobs2),
@@ -827,9 +1000,11 @@ app.get('/api/stats', async (req, res) => {
   else if (source === 'overseas') allJobs = allJobs.filter(j => overseasCompanyNames.includes(j.company));
   if (company) allJobs = allJobs.filter(j => j.company === company);
 
-  // 过滤游戏 + 清理部门
+  // 过滤游戏 + AI 相关性过滤 + 清理部门
   allJobs = filterGameJobs(allJobs);
+  allJobs = allJobs.filter(isAiRelevantJob);
   cleanDepartments(allJobs);
+  allJobs.forEach(job => { job.jobCategory = classifyJobCategory(job); });
   if (kw) {
     const query = kw.toLowerCase().trim();
     allJobs = allJobs.filter(job => [
@@ -948,6 +1123,24 @@ app.post('/api/cache/clear', (req, res) => {
 // 健康检查
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString(), browser: browserInstance?.connected || false, cacheSize: cache.size });
+});
+
+// ============ 生产模式：托管前端构建产物（client/dist）============
+// 存在 dist 时可单进程同时提供页面与 API：npm run build 后直接 node server/index.js
+const CLIENT_DIST = path.join(__dirname, '..', 'client', 'dist');
+if (fs.existsSync(CLIENT_DIST)) {
+  app.use(express.static(CLIENT_DIST));
+  app.use((req, res, next) => {
+    if (req.method === 'GET' && !req.path.startsWith('/api/')) {
+      return res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+    }
+    next();
+  });
+}
+
+// 404 兜底（未构建前端时 API 之外的路径）
+app.use((req, res) => {
+  res.status(404).json({ error: '接口不存在', path: req.path });
 });
 
 // 优雅关闭
